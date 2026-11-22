@@ -1,2 +1,13 @@
 # Local sample/server data (may contain player UUIDs, names, and passwords)
 samples/
+
+# Local migration configs (may contain database passwords) and generated outputs
+migration.yml
+*.local.yml
+migration-output/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+
