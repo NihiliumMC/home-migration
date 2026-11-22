@@ -1,0 +1,53 @@
+# Example migration config for scripts/migrate_ultimatehomes.py
+# Copy to migration.yml (which is gitignored) and fill in your paths/credentials:
+#   cp migration.example.yml migration.yml
+#   chmod 600 migration.yml
+#
+# Run:
+#   python3 scripts/migrate_ultimatehomes.py scan --config migration.yml
+#   python3 scripts/migrate_ultimatehomes.py apply --config migration.yml
+#   python3 scripts/migrate_ultimatehomes.py verify --config migration.yml
+
+ultimatehomes:
+  playerdata: /path/to/plugins/UltimateHomes/playerdata
+
+huskhomes:
+  config: /path/to/plugins/HuskHomes/config.yml
+  server_name: server
+  # Optional overrides if HuskHomes/config.yml doesn't already contain them
+  # (e.g. testing against a staging MySQL DB while config.yml points elsewhere):
+  # backend: MYSQL          # SQLITE | MYSQL | MARIADB
+  # sqlite: /path/to/HuskHomesData.db
+  # mysql:
+  #   host: 127.0.0.1
+  #   port: 3306
+  #   database: huskhomes
+  #   user: huskhomes_user
+  #   password: ""          # optional; falls back to password_env or HuskHomes/config.yml
+  #   password_env: HUSKHOMES_DB_PASSWORD
+
+nlogin:
+  # csv: /path/to/nlogin.csv   # optional offline CSV instead of MySQL
+  mysql:
+    host: 127.0.0.1
+    port: 3306
+    database: nlogin
+    user: nlogin_user
+    password: ""
+    password_env: NLOGIN_DB_PASSWORD
+  table: nlogin
+  columns:
+    name: last_name
+    unique_id: unique_id
+    mojang_id: mojang_id
+    bedrock_id: bedrock_id
+
+migration:
+  output: ./migration-output/plan.json
+  # report: ./migration-output/plan.md
+  backup_dir: ./migration-output/backups
+  on_conflict: fail            # fail | rename | skip
+  require_nlogin_match: false
+  # uuid_map: ./overrides.csv
+  # world_uuids:
+  #   world: 00000000-0000-0000-0000-000000000000

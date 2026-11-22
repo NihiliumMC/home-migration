@@ -482,5 +482,98 @@ class MigrationTests(unittest.TestCase):
                     db.close()
 
 
+    def test_config_file_mysql_workflow_and_no_secret_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_dir = root / "ops"
+            cfg_dir.mkdir()
+            playerdata = root / "playerdata"
+            playerdata.mkdir()
+            bob_id = uuid.uuid4()
+            (playerdata / f"{MIGRATE.offline_uuid('Bob')}.yml").write_text(
+                "player:\n  info:\n    lastSeenAs: Bob\nhomes:\n  base:\n"
+                "    x: 10\n    y: 70\n    z: 20\n    yaw: 45.0\n    pitch: 10.0\n    world: world\n",
+                encoding="utf-8",
+            )
+
+            hh_cfg_path = root / "huskhomes_config.yml"
+            write_huskhomes_config(hh_cfg_path, backend="MYSQL")
+            mysql_backing = root / "mysql_sim.db"
+            create_sqlite_db(mysql_backing)
+
+            nlogin_backing = root / "nlogin_sim.db"
+            nc = sqlite3.connect(str(nlogin_backing))
+            nc.execute(
+                "CREATE TABLE `nlogin` (last_name TEXT, unique_id TEXT, mojang_id TEXT, bedrock_id TEXT)"
+            )
+            nc.execute("INSERT INTO `nlogin` VALUES (?, ?, ?, ?)", ("Bob", bob_id.hex, None, None))
+            nc.commit()
+            nc.close()
+
+            nlogin_secret = "super-secret-nlogin-pw-99"
+            hh_secret = "super-secret-huskhomes-pw-88"
+            migration_cfg = cfg_dir / "migration.yml"
+            migration_cfg.write_text(
+                yaml.safe_dump({
+                    "ultimatehomes": {"playerdata": "../playerdata"},
+                    "huskhomes": {
+                        "config": "../huskhomes_config.yml",
+                        "server_name": "survival",
+                        "mysql": {"password": hh_secret},
+                    },
+                    "nlogin": {
+                        "mysql": {
+                            "host": "127.0.0.1",
+                            "port": 3306,
+                            "database": "nlogin_db",
+                            "user": "nlogin_u",
+                            "password": nlogin_secret,
+                        }
+                    },
+                    "migration": {
+                        "output": "./out/plan.json",
+                        "backup_dir": "./out/backups",
+                        "on_conflict": "fail",
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            fake_pymysql = types.ModuleType("pymysql")
+            fake_cursors = types.ModuleType("pymysql.cursors")
+            fake_cursors.DictCursor = object
+            fake_pymysql.cursors = fake_cursors
+            seen_passwords: list[tuple[str, str]] = []
+
+            def fake_connect(**kwargs):
+                seen_passwords.append((str(kwargs.get("database")), str(kwargs.get("password"))))
+                if kwargs.get("database") == "nlogin_db":
+                    return FakeMySQLConnection(nlogin_backing, "nlogin_db")
+                return FakeMySQLConnection(mysql_backing, "huskhomes")
+
+            fake_pymysql.connect = fake_connect
+
+            def fake_run(cmd, stdout=None, stderr=None, env=None, check=False):
+                if stdout is not None:
+                    stdout.write(b"-- fake mysqldump\n")
+                return mock.Mock(returncode=0, stderr=b"")
+
+            with mock.patch.dict(sys.modules, {"pymysql": fake_pymysql, "pymysql.cursors": fake_cursors}), \
+                 mock.patch.object(MIGRATE.shutil, "which", return_value="/usr/bin/mysqldump"), \
+                 mock.patch.object(MIGRATE.subprocess, "run", side_effect=fake_run):
+                self.assertEqual(MIGRATE.main(["scan", "--config", str(migration_cfg)]), 0)
+                self.assertEqual(MIGRATE.main(["apply", "--config", str(migration_cfg)]), 0)
+                self.assertEqual(MIGRATE.main(["verify", "--config", str(migration_cfg)]), 0)
+
+            self.assertIn(("nlogin_db", nlogin_secret), seen_passwords)
+            self.assertIn(("huskhomes", hh_secret), seen_passwords)
+
+            # Passwords must never be serialized into generated artifacts.
+            for artifact in (cfg_dir / "out" / "plan.json", cfg_dir / "out" / "plan.md", cfg_dir / "out" / "plan.csv"):
+                content = artifact.read_text(encoding="utf-8")
+                self.assertNotIn(nlogin_secret, content)
+                self.assertNotIn(hh_secret, content)
+
+
 if __name__ == "__main__":
     unittest.main()

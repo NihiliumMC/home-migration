@@ -7,7 +7,8 @@ This repository holds a migration tool (`scripts/migrate_ultimatehomes.py`) that
 
 ## Repository Layout
 - `scripts/migrate_ultimatehomes.py`: Self-contained Python 3 CLI implementing `scan`, `apply`, and `verify`.
-- `tests/test_migrate_ultimatehomes.py`: Automated `unittest` suite covering parsing, nLogin identity resolution, home name allocation, SQLite end-to-end migration, and MySQL backend behavior.
+- `migration.example.yml`: Template YAML config file (`--config migration.yml`) for paths, database credentials, and migration options; `migration.yml` and `migration-output/` are gitignored.
+- `tests/test_migrate_ultimatehomes.py`: Automated `unittest` suite covering parsing, nLogin identity resolution, home name allocation, config-file loading, SQLite end-to-end migration, and MySQL backend behavior.
 - `requirements.txt`: Python dependencies (`PyYAML`, `PyMySQL`, `cryptography`).
 - `README.md`: Operator runbook for production migration.
 - `samples/`: Gitignored local test/sample fixtures (`ultimatehomes/playerdata/`, `huskhomes/`, `nlogin/`).

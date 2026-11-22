@@ -696,11 +696,20 @@ def load_nlogin_csv(path: Path) -> list[dict[str, Any]]:
 
 
 def resolve_mysql_password(args: argparse.Namespace, prefix: str) -> str:
+    from_cli = getattr(args, f"_{prefix}_password_from_cli", False)
+    direct = getattr(args, f"{prefix}_password", None)
+    if from_cli and direct:
+        warn(f"passing the {prefix} database password on the command line is visible in process listings")
+        return direct
+    config_pw = getattr(args, f"{prefix}_config_password", None)
+    if config_pw:
+        return str(config_pw)
     env_name = getattr(args, f"{prefix}_password_env", None)
     if env_name and os.environ.get(env_name) is not None:
         return os.environ[env_name]
-    direct = getattr(args, f"{prefix}_password", None)
     if direct:
+        if not from_cli:
+            return str(direct)
         warn(f"passing the {prefix} database password on the command line is visible in process listings")
         return direct
     if sys.stdin.isatty():
@@ -827,6 +836,8 @@ def load_nlogin_rows_for_plan(
         nlogin_bedrock_id_column=info.get("bedrock_id_column") or "bedrock_id",
         nlogin_password_env=getattr(args, "nlogin_password_env", "NLOGIN_DB_PASSWORD"),
         nlogin_password=getattr(args, "nlogin_password", None),
+        nlogin_config_password=getattr(args, "nlogin_config_password", None),
+        _nlogin_password_from_cli=getattr(args, "_nlogin_password_from_cli", False),
     )
     if not namespace.nlogin_mysql_host or not namespace.nlogin_mysql_database or not namespace.nlogin_mysql_user:
         raise MigrationError("plan's nLogin MySQL connection details are incomplete")
@@ -1091,12 +1102,18 @@ def read_huskhomes_config(path: Path, args: argparse.Namespace) -> HuskHomesConf
         result.mysql_port = int(args.huskhomes_mysql_port or credentials.get("port") or 3306)
         result.mysql_database = args.huskhomes_mysql_database or credentials.get("database")
         result.mysql_user = args.huskhomes_mysql_user or credentials.get("username")
-        env_name = args.huskhomes_password_env
-        if env_name and os.environ.get(env_name) is not None:
-            result.mysql_password = os.environ[env_name]
-        elif args.huskhomes_password:
+        env_name = getattr(args, "huskhomes_password_env", "HUSKHOMES_DB_PASSWORD") or "HUSKHOMES_DB_PASSWORD"
+        from_cli = getattr(args, "_huskhomes_password_from_cli", False)
+        config_pw = getattr(args, "huskhomes_config_password", None)
+        if from_cli and args.huskhomes_password:
             warn("passing the HuskHomes database password on the command line is visible in process listings")
             result.mysql_password = args.huskhomes_password
+        elif config_pw:
+            result.mysql_password = str(config_pw)
+        elif env_name and os.environ.get(env_name) is not None:
+            result.mysql_password = os.environ[env_name]
+        elif args.huskhomes_password:
+            result.mysql_password = str(args.huskhomes_password)
         else:
             result.mysql_password = str(credentials.get("password") or "")
         if not result.mysql_database:
@@ -2667,9 +2684,140 @@ def cmd_verify(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def resolve_config_path(base_dir: Path, raw: Any) -> Optional[str]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return str(path)
+
+
+def load_migration_config(path: Path) -> tuple[Path, dict[str, Any]]:
+    if not path.is_file():
+        raise MigrationError(f"migration config file not found: {path}")
+    raw = load_yaml(path)
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise MigrationError(f"migration config must be a YAML mapping: {path}")
+    return path.resolve().parent, raw
+
+
+def apply_migration_config(args: argparse.Namespace) -> None:
+    args._nlogin_password_from_cli = bool(getattr(args, "nlogin_password", None))
+    args._huskhomes_password_from_cli = bool(getattr(args, "huskhomes_password", None))
+    args.nlogin_config_password = None
+    args.huskhomes_config_password = None
+
+    config_file = getattr(args, "config", None)
+    if config_file:
+        base_dir, cfg = load_migration_config(Path(config_file).resolve())
+    else:
+        base_dir, cfg = Path.cwd(), {}
+
+    uh = cfg.get("ultimatehomes") or {}
+    if not isinstance(uh, dict):
+        raise MigrationError("migration config 'ultimatehomes' must be a mapping")
+    hh = cfg.get("huskhomes") or {}
+    if not isinstance(hh, dict):
+        raise MigrationError("migration config 'huskhomes' must be a mapping")
+    hh_mysql = hh.get("mysql") or {}
+    if not isinstance(hh_mysql, dict):
+        raise MigrationError("migration config 'huskhomes.mysql' must be a mapping")
+    nl = cfg.get("nlogin") or {}
+    if not isinstance(nl, dict):
+        raise MigrationError("migration config 'nlogin' must be a mapping")
+    nl_mysql = nl.get("mysql") or {}
+    if not isinstance(nl_mysql, dict):
+        raise MigrationError("migration config 'nlogin.mysql' must be a mapping")
+    nl_cols = nl.get("columns") or {}
+    if not isinstance(nl_cols, dict):
+        raise MigrationError("migration config 'nlogin.columns' must be a mapping")
+    mig = cfg.get("migration") or {}
+    if not isinstance(mig, dict):
+        raise MigrationError("migration config 'migration' must be a mapping")
+
+    def pick(attr: str, fallback: Any, default: Any = None) -> None:
+        if getattr(args, attr, None) is None:
+            setattr(args, attr, fallback if fallback is not None else default)
+
+    # Shared HuskHomes target settings
+    pick("huskhomes_config", resolve_config_path(base_dir, hh.get("config")))
+    pick("huskhomes_backend", str(hh["backend"]).upper() if hh.get("backend") else None)
+    pick("huskhomes_sqlite", resolve_config_path(base_dir, hh.get("sqlite")))
+    pick("huskhomes_mysql_host", hh_mysql.get("host"))
+    pick("huskhomes_mysql_port", int(hh_mysql["port"]) if hh_mysql.get("port") is not None else None)
+    pick("huskhomes_mysql_database", hh_mysql.get("database"))
+    pick("huskhomes_mysql_user", hh_mysql.get("user"))
+    pick("huskhomes_password_env", hh_mysql.get("password_env"), "HUSKHOMES_DB_PASSWORD")
+    if hh_mysql.get("password") not in (None, ""):
+        args.huskhomes_config_password = str(hh_mysql.get("password"))
+    pick("server_name", hh.get("server_name"), DEFAULT_SERVER_NAME)
+
+    # nLogin verification/connection password settings
+    pick("nlogin_password_env", nl_mysql.get("password_env"), "NLOGIN_DB_PASSWORD")
+    if nl_mysql.get("password") not in (None, ""):
+        args.nlogin_config_password = str(nl_mysql.get("password"))
+
+    if args.command == "scan":
+        pick("playerdata", resolve_config_path(base_dir, uh.get("playerdata")))
+        pick("output", resolve_config_path(base_dir, mig.get("output")))
+        pick("report", resolve_config_path(base_dir, mig.get("report")))
+        pick("uuid_map", resolve_config_path(base_dir, mig.get("uuid_map")))
+        pick("on_conflict", mig.get("on_conflict"), "fail")
+        if args.on_conflict not in ("fail", "rename", "skip"):
+            raise MigrationError(f"invalid migration.on_conflict in config: {args.on_conflict!r}")
+        if args.require_nlogin_match is None:
+            args.require_nlogin_match = bool(mig.get("require_nlogin_match", False))
+
+        cfg_worlds = mig.get("world_uuids") or {}
+        if cfg_worlds:
+            if not isinstance(cfg_worlds, dict):
+                raise MigrationError("migration config 'migration.world_uuids' must be a mapping")
+            combined_worlds = [f"{k}={v}" for k, v in cfg_worlds.items()]
+            combined_worlds.extend(args.world_uuid or [])
+            args.world_uuid = combined_worlds
+
+        pick("nlogin_csv", resolve_config_path(base_dir, nl.get("csv")))
+        pick("nlogin_mysql_host", nl_mysql.get("host"))
+        pick("nlogin_mysql_port", int(nl_mysql["port"]) if nl_mysql.get("port") is not None else None, 3306)
+        pick("nlogin_mysql_database", nl_mysql.get("database"))
+        pick("nlogin_mysql_user", nl_mysql.get("user"))
+        pick("nlogin_table", nl.get("table"), "nlogin")
+        pick("nlogin_name_column", nl_cols.get("name"), "last_name")
+        pick("nlogin_unique_id_column", nl_cols.get("unique_id"), "unique_id")
+        pick("nlogin_mojang_id_column", nl_cols.get("mojang_id"), "mojang_id")
+        pick("nlogin_bedrock_id_column", nl_cols.get("bedrock_id"), "bedrock_id")
+
+        if not args.playerdata:
+            raise MigrationError("missing --playerdata (or ultimatehomes.playerdata in --config)")
+        if not args.output:
+            raise MigrationError("missing --output (or migration.output in --config)")
+    elif args.command in ("apply", "verify"):
+        pick("plan", resolve_config_path(base_dir, mig.get("plan") or mig.get("output")))
+        if args.command == "apply":
+            pick("backup_dir", resolve_config_path(base_dir, mig.get("backup_dir")))
+        if not args.plan:
+            raise MigrationError("missing --plan (or migration.output in --config)")
+
+    if not args.huskhomes_config:
+        raise MigrationError("missing --huskhomes-config (or huskhomes.config in --config)")
+
+
+def add_config_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-c", "--config",
+        help="Path to migration YAML config file (CLI flags override config values)",
+    )
+
+
 def add_target_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--huskhomes-config", required=True,
+        "--huskhomes-config",
         help="Path to plugins/HuskHomes/config.yml",
     )
     parser.add_argument(
@@ -2685,15 +2833,15 @@ def add_target_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--huskhomes-mysql-database", help="Override HuskHomes MySQL database")
     parser.add_argument("--huskhomes-mysql-user", help="Override HuskHomes MySQL user")
     parser.add_argument(
-        "--huskhomes-password-env", default="HUSKHOMES_DB_PASSWORD",
-        help="Environment variable containing the HuskHomes MySQL password",
+        "--huskhomes-password-env", default=None,
+        help="Environment variable containing the HuskHomes MySQL password (default: HUSKHOMES_DB_PASSWORD)",
     )
     parser.add_argument(
         "--huskhomes-password",
-        help="HuskHomes MySQL password (prefer --huskhomes-password-env)",
+        help="HuskHomes MySQL password (prefer --config or --huskhomes-password-env)",
     )
     parser.add_argument(
-        "--server-name", default=DEFAULT_SERVER_NAME,
+        "--server-name", default=None,
         help=f"HuskHomes server_name for new positions (default: {DEFAULT_SERVER_NAME})",
     )
 
@@ -2701,32 +2849,32 @@ def add_target_arguments(parser: argparse.ArgumentParser) -> None:
 def add_nlogin_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--nlogin-csv", help="Use a CSV export instead of connecting to MySQL")
     parser.add_argument("--nlogin-mysql-host", help="nLogin MySQL host")
-    parser.add_argument("--nlogin-mysql-port", type=int, default=3306, help="nLogin MySQL port")
+    parser.add_argument("--nlogin-mysql-port", type=int, default=None, help="nLogin MySQL port (default: 3306)")
     parser.add_argument("--nlogin-mysql-database", help="nLogin MySQL database name")
     parser.add_argument("--nlogin-mysql-user", help="nLogin MySQL user")
     parser.add_argument(
-        "--nlogin-password-env", default="NLOGIN_DB_PASSWORD",
-        help="Environment variable containing the nLogin MySQL password",
+        "--nlogin-password-env", default=None,
+        help="Environment variable containing the nLogin MySQL password (default: NLOGIN_DB_PASSWORD)",
     )
     parser.add_argument(
         "--nlogin-password",
-        help="nLogin MySQL password (prefer --nlogin-password-env)",
+        help="nLogin MySQL password (prefer --config or --nlogin-password-env)",
     )
-    parser.add_argument("--nlogin-table", default="nlogin", help="nLogin accounts table (default: nlogin)")
-    parser.add_argument("--nlogin-name-column", default="last_name", help="nLogin name column")
-    parser.add_argument("--nlogin-unique-id-column", default="unique_id", help="nLogin unique_id column")
-    parser.add_argument("--nlogin-mojang-id-column", default="mojang_id", help="nLogin mojang_id column")
-    parser.add_argument("--nlogin-bedrock-id-column", default="bedrock_id", help="nLogin bedrock_id column")
+    parser.add_argument("--nlogin-table", default=None, help="nLogin accounts table (default: nlogin)")
+    parser.add_argument("--nlogin-name-column", default=None, help="nLogin name column (default: last_name)")
+    parser.add_argument("--nlogin-unique-id-column", default=None, help="nLogin unique_id column (default: unique_id)")
+    parser.add_argument("--nlogin-mojang-id-column", default=None, help="nLogin mojang_id column (default: mojang_id)")
+    parser.add_argument("--nlogin-bedrock-id-column", default=None, help="nLogin bedrock_id column (default: bedrock_id)")
 
 
 def add_nlogin_verify_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--nlogin-password-env", default="NLOGIN_DB_PASSWORD",
-        help="Environment variable containing the nLogin MySQL password",
+        "--nlogin-password-env", default=None,
+        help="Environment variable containing the nLogin MySQL password (default: NLOGIN_DB_PASSWORD)",
     )
     parser.add_argument(
         "--nlogin-password",
-        help="nLogin MySQL password (prefer --nlogin-password-env)",
+        help="nLogin MySQL password (prefer --config or --nlogin-password-env)",
     )
     parser.add_argument(
         "--skip-nlogin-verify", action="store_true",
@@ -2741,23 +2889,24 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Typical use:\n"
             "  1. stop the server\n"
-            "  2. export NLOGIN_DB_PASSWORD=...\n"
-            "  3. python3 migrate_ultimatehomes.py scan ...\n"
-            "  4. read the report\n"
-            "  5. python3 migrate_ultimatehomes.py apply ...\n"
-            "  6. python3 migrate_ultimatehomes.py verify ...\n"
+            "  2. cp migration.example.yml migration.yml && chmod 600 migration.yml\n"
+            "  3. python3 migrate_ultimatehomes.py scan --config migration.yml\n"
+            "  4. read the generated report\n"
+            "  5. python3 migrate_ultimatehomes.py apply --config migration.yml\n"
+            "  6. python3 migrate_ultimatehomes.py verify --config migration.yml\n"
         ),
     )
     parser.add_argument("--debug", action="store_true", help="Print a traceback on unexpected errors")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     scan = subparsers.add_parser("scan", help="Read source/target data and write a migration plan")
-    scan.add_argument("--playerdata", required=True, help="UltimateHomes playerdata directory")
-    scan.add_argument("--output", required=True, help="Where to write the plan JSON")
+    add_config_argument(scan)
+    scan.add_argument("--playerdata", help="UltimateHomes playerdata directory")
+    scan.add_argument("--output", help="Where to write the plan JSON")
     scan.add_argument("--report", help="Where to write the Markdown report (default: plan.md)")
     scan.add_argument("--uuid-map", help="Optional CSV: source_uuid,target_uuid[,username]")
     scan.add_argument(
-        "--on-conflict", choices=("fail", "rename", "skip"), default="fail",
+        "--on-conflict", choices=("fail", "rename", "skip"), default=None,
         help="What to do when a home name conflicts (default: fail)",
     )
     scan.add_argument(
@@ -2765,21 +2914,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override a world UUID: NAME=UUID (repeatable)",
     )
     scan.add_argument(
-        "--require-nlogin-match", action="store_true",
+        "--require-nlogin-match", action="store_true", default=None,
         help="Fail if a player with homes has no matching nLogin account",
     )
     add_target_arguments(scan)
     add_nlogin_arguments(scan)
 
     apply = subparsers.add_parser("apply", help="Apply a previously scanned plan")
-    apply.add_argument("--plan", required=True, help="Plan JSON from the scan command")
+    add_config_argument(apply)
+    apply.add_argument("--plan", help="Plan JSON from the scan command")
     apply.add_argument("--backup-dir", help="Directory for pre-apply backups")
     apply.add_argument("--no-backup", action="store_true", help="Do not create a backup")
     add_target_arguments(apply)
     add_nlogin_verify_arguments(apply)
 
     verify = subparsers.add_parser("verify", help="Verify that an applied plan matches the database")
-    verify.add_argument("--plan", required=True, help="Plan JSON from the scan command")
+    add_config_argument(verify)
+    verify.add_argument("--plan", help="Plan JSON from the scan command")
     add_target_arguments(verify)
     add_nlogin_verify_arguments(verify)
 
@@ -2790,6 +2941,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        apply_migration_config(args)
         if args.command == "scan":
             return cmd_scan(args)
         if args.command == "apply":

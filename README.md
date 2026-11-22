@@ -27,42 +27,30 @@ python3 -m pip install -r requirements.txt
 ## Production Runbook (nLogin MySQL + HuskHomes MySQL)
 
 1. **Stop the Minecraft server / proxy** so neither nLogin nor HuskHomes writes while migrating.
-2. **Export database passwords** (avoid passing secrets on the command line):
+2. **Create a local `migration.yml`** from the example template (`migration.yml` is gitignored):
    ```bash
-   export NLOGIN_DB_PASSWORD='...'
-   export HUSKHOMES_DB_PASSWORD='...'   # optional if already in HuskHomes/config.yml
+   cp migration.example.yml migration.yml
+   chmod 600 migration.yml
    ```
+   Fill in `ultimatehomes.playerdata`, `huskhomes.config`, and `nlogin.mysql` (host, database, user, password). If your production `HuskHomes/config.yml` already has `type: MYSQL` and valid `credentials`, you don't need to repeat them under `huskhomes.mysql`.
 3. **Scan (read-only)** and generate the plan, Markdown audit report, and CSV:
    ```bash
-   python3 scripts/migrate_ultimatehomes.py scan \
-     --playerdata /path/to/plugins/UltimateHomes/playerdata \
-     --huskhomes-config /path/to/plugins/HuskHomes/config.yml \
-     --server-name server \
-     --nlogin-mysql-host 127.0.0.1 \
-     --nlogin-mysql-port 3306 \
-     --nlogin-mysql-database nlogin \
-     --nlogin-mysql-user nlogin_user \
-     --output ./migration-output/plan.json
+   python3 scripts/migrate_ultimatehomes.py scan --config migration.yml
    ```
-   - If your production `HuskHomes/config.yml` uses `type: MYSQL`, the host/port/database/user/table names are read automatically (and can be overridden with `--huskhomes-mysql-*` or `--huskhomes-backend MYSQL`).
-   - If `--server-name` differs from `"server"`, set it to match `HuskHomes/server.yml` (cross-server mode) or `"server"` (single-server default).
-   - If you already have homes in HuskHomes that might share names with UltimateHomes homes, review conflicts or pass `--on-conflict rename`.
+   - Any CLI flag (e.g. `--on-conflict rename`, `--server-name lobby`) overrides `migration.yml`.
+   - Set `huskhomes.server_name` to match `HuskHomes/server.yml` if using cross-server mode (default is `"server"`).
+   - If you already have homes in HuskHomes that might share names with UltimateHomes homes, review conflicts or set `migration.on_conflict: rename`.
 4. **Inspect `./migration-output/plan.md` (and `plan.csv`)**:
    - Check **Errors** (must be `0` before `apply` can run).
-   - Check **User warnings** (e.g. players missing from nLogin or missing `lastSeenAs`). Provide a `--uuid-map overrides.csv` (`source_uuid,target_uuid,username`) if needed and re-run `scan`.
+   - Check **User warnings** (e.g. players missing from nLogin or missing `lastSeenAs`). Provide a `migration.uuid_map` CSV (`source_uuid,target_uuid,username`) if needed and re-run `scan`.
    - Check **Renamed homes** (any home name >16 chars or disallowed by HuskHomes' regex).
 5. **Apply**:
    ```bash
-   python3 scripts/migrate_ultimatehomes.py apply \
-     --plan ./migration-output/plan.json \
-     --huskhomes-config /path/to/plugins/HuskHomes/config.yml \
-     --backup-dir ./migration-output/backups
+   python3 scripts/migrate_ultimatehomes.py apply --config migration.yml
    ```
 6. **Verify** (independent read-only check; also runs automatically at the end of `apply`):
    ```bash
-   python3 scripts/migrate_ultimatehomes.py verify \
-     --plan ./migration-output/plan.json \
-     --huskhomes-config /path/to/plugins/HuskHomes/config.yml
+   python3 scripts/migrate_ultimatehomes.py verify --config migration.yml
    ```
 7. **Start the server** and spot-check `/homes` and `/home <name>` in-game.
 
