@@ -1,6 +1,7 @@
 import csv
 import importlib.util
 import json
+import re
 import sqlite3
 import struct
 import sys
@@ -105,15 +106,52 @@ def create_sqlite_db(path: Path) -> None:
 
 
 class FakeMySQLCursor:
-    def __init__(self, conn: sqlite3.Connection, db_name: str, engine: str = "InnoDB", float32_cols: bool = True):
+    def __init__(self, conn: sqlite3.Connection, db_name: str, engine: str = "InnoDB", float32_cols: bool = True, counter=None):
         self.conn = conn
         self.db_name = db_name
         self.engine = engine
         self.float32_cols = float32_cols
+        self.counter = counter
         self.lastrowid = None
         self._rows: list[dict] = []
 
+    def _round_position_params(self, normalized: str, params):
+        if not self.float32_cols:
+            return params
+        if "INSERT INTO `huskhomes_position_data`" in normalized:
+            cols_match = re.search(r"INSERT INTO `huskhomes_position_data`\s*\(([^)]+)\)", normalized)
+            if cols_match:
+                cols = [c.strip().strip("`") for c in cols_match.group(1).split(",")]
+                yaw_idx = cols.index("yaw")
+                pitch_idx = cols.index("pitch")
+                stride = len(cols)
+                params = list(params)
+                for base in range(0, len(params), stride):
+                    params[base + yaw_idx] = struct.unpack("f", struct.pack("f", float(params[base + yaw_idx])))[0]
+                    params[base + pitch_idx] = struct.unpack("f", struct.pack("f", float(params[base + pitch_idx])))[0]
+                return tuple(params)
+        if "UPDATE `huskhomes_position_data`" in normalized:
+            set_match = re.search(r"SET\s+(.+?)\s+WHERE\s+", normalized)
+            if set_match:
+                params = list(params)
+                param_offset = 0
+                for clause in set_match.group(1).split(", "):
+                    col_name = clause.split("=")[0].strip().strip("`")
+                    ph_count = clause.count("%s")
+                    if col_name in ("yaw", "pitch"):
+                        if "CASE " in clause:
+                            for idx in range(1, ph_count, 2):
+                                pos = param_offset + idx
+                                params[pos] = struct.unpack("f", struct.pack("f", float(params[pos])))[0]
+                        elif ph_count == 1:
+                            params[param_offset] = struct.unpack("f", struct.pack("f", float(params[param_offset])))[0]
+                    param_offset += ph_count
+                return tuple(params)
+        return params
+
     def execute(self, sql: str, params=()) -> None:
+        if self.counter is not None:
+            self.counter[0] += 1
         normalized = " ".join(sql.split())
         if "FROM information_schema.COLUMNS" in normalized:
             table_name = params[1]
@@ -129,16 +167,7 @@ class FakeMySQLCursor:
             return
         # Translate PyMySQL %s placeholders and LOWER/etc. for SQLite backing.
         sqlite_sql = sql.replace("%s", "?")
-        if self.float32_cols and "INSERT INTO `huskhomes_position_data`" in normalized:
-            params = list(params)
-            params[3] = struct.unpack("f", struct.pack("f", float(params[3])))[0]
-            params[4] = struct.unpack("f", struct.pack("f", float(params[4])))[0]
-            params = tuple(params)
-        if self.float32_cols and "UPDATE `huskhomes_position_data`" in normalized:
-            params = list(params)
-            params[3] = struct.unpack("f", struct.pack("f", float(params[3])))[0]
-            params[4] = struct.unpack("f", struct.pack("f", float(params[4])))[0]
-            params = tuple(params)
+        params = self._round_position_params(normalized, params)
         cur = self.conn.execute(sqlite_sql, params)
         self.lastrowid = cur.lastrowid
         if cur.description:
@@ -146,6 +175,10 @@ class FakeMySQLCursor:
             self._rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         else:
             self._rows = []
+
+    def executemany(self, sql: str, seq_of_params) -> None:
+        for params in seq_of_params:
+            self.execute(sql, params)
 
     def fetchall(self):
         return list(self._rows)
@@ -172,9 +205,10 @@ class FakeMySQLConnection:
         self.begun = False
         self.committed = 0
         self.rolled_back = 0
+        self.query_count = [0]
 
     def cursor(self):
-        return FakeMySQLCursor(self.sqlite_conn, self.db_name, engine=self.engine)
+        return FakeMySQLCursor(self.sqlite_conn, self.db_name, engine=self.engine, counter=self.query_count)
 
     def begin(self):
         self.begun = True
@@ -573,6 +607,209 @@ class MigrationTests(unittest.TestCase):
                 content = artifact.read_text(encoding="utf-8")
                 self.assertNotIn(nlogin_secret, content)
                 self.assertNotIn(hh_secret, content)
+
+    def test_mysql_batched_apply_and_update_query_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playerdata = root / "playerdata"
+            playerdata.mkdir()
+
+            nlogin_lines = ["last_name,unique_id,mojang_id\n"]
+            for i in range(300):
+                name = f"Player{i:03d}"
+                p_uuid = MIGRATE.offline_uuid(name)
+                nlogin_lines.append(f"{name},{p_uuid},\n")
+                (playerdata / f"{p_uuid}.yml").write_text(
+                    f"player:\n  info:\n    lastSeenAs: {name}\n"
+                    f"homes:\n"
+                    f"  home1:\n    x: {i}\n    y: 64\n    z: {i * 2}\n    yaw: 45.12345\n    pitch: -12.34567\n    world: world\n"
+                    f"  home2:\n    x: {i + 10}\n    y: 70\n    z: {-i}\n    yaw: 178.52899\n    pitch: 89.899994\n    world: world_nether\n",
+                    encoding="utf-8",
+                )
+
+            nlogin_csv = root / "nlogin.csv"
+            nlogin_csv.write_text("".join(nlogin_lines), encoding="utf-8")
+
+            cfg_path = root / "config.yml"
+            write_huskhomes_config(cfg_path, backend="MYSQL")
+            mysql_backing = root / "mysql_sim.db"
+            create_sqlite_db(mysql_backing)
+
+            fake_pymysql = types.ModuleType("pymysql")
+            fake_cursors = types.ModuleType("pymysql.cursors")
+            fake_cursors.DictCursor = object
+            fake_pymysql.cursors = fake_cursors
+
+            hh_conns: list[FakeMySQLConnection] = []
+
+            def fake_connect(**kwargs):
+                c = FakeMySQLConnection(mysql_backing, "huskhomes")
+                hh_conns.append(c)
+                return c
+
+            fake_pymysql.connect = fake_connect
+            plan_path = root / "plan.json"
+
+            with mock.patch.dict(sys.modules, {"pymysql": fake_pymysql, "pymysql.cursors": fake_cursors}), \
+                 mock.patch.dict("os.environ", {"HUSKHOMES_DB_PASSWORD": "hpw"}):
+                self.assertEqual(MIGRATE.main([
+                    "scan",
+                    "--playerdata", str(playerdata),
+                    "--nlogin-csv", str(nlogin_csv),
+                    "--huskhomes-config", str(cfg_path),
+                    "--output", str(plan_path),
+                ]), 0)
+
+                hh_conns.clear()
+                self.assertEqual(MIGRATE.main([
+                    "apply",
+                    "--plan", str(plan_path),
+                    "--huskhomes-config", str(cfg_path),
+                    "--no-backup",
+                ]), 0)
+                apply_queries = hh_conns[-1].query_count[0]
+                # 600 homes + 300 users must be batched into well under 100 queries (was ~3,600+).
+                self.assertLess(apply_queries, 60)
+
+                self.assertEqual(MIGRATE.main([
+                    "verify",
+                    "--plan", str(plan_path),
+                    "--huskhomes-config", str(cfg_path),
+                ]), 0)
+
+                # Modify all 300 player files and verify batched CASE UPDATEs.
+                for i in range(300):
+                    name = f"Player{i:03d}"
+                    p_uuid = MIGRATE.offline_uuid(name)
+                    (playerdata / f"{p_uuid}.yml").write_text(
+                        f"player:\n  info:\n    lastSeenAs: {name}\n"
+                        f"homes:\n"
+                        f"  home1:\n    x: {i + 500}\n    y: 65\n    z: {i * 2}\n    yaw: 90.25\n    pitch: 15.5\n    world: world\n"
+                        f"  home2:\n    x: {i + 510}\n    y: 71\n    z: {-i}\n    yaw: -45.75\n    pitch: 0.0\n    world: world_nether\n",
+                        encoding="utf-8",
+                    )
+
+                plan2_path = root / "plan2.json"
+                self.assertEqual(MIGRATE.main([
+                    "scan",
+                    "--playerdata", str(playerdata),
+                    "--nlogin-csv", str(nlogin_csv),
+                    "--huskhomes-config", str(cfg_path),
+                    "--output", str(plan2_path),
+                ]), 0)
+                plan2 = json.loads(plan2_path.read_text(encoding="utf-8"))
+                self.assertEqual(plan2["summary"]["actions"], {"update": 600})
+
+                hh_conns.clear()
+                self.assertEqual(MIGRATE.main([
+                    "apply",
+                    "--plan", str(plan2_path),
+                    "--huskhomes-config", str(cfg_path),
+                    "--no-backup",
+                ]), 0)
+                update_queries = hh_conns[-1].query_count[0]
+                self.assertLess(update_queries, 60)
+
+    def test_sqlite_skip_policy_and_user_conflict_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            playerdata = root / "playerdata"
+            playerdata.mkdir()
+            alice_uuid = MIGRATE.offline_uuid("Alice")
+            (playerdata / f"{alice_uuid}.yml").write_text(
+                "player:\n  info:\n    lastSeenAs: Alice\nhomes:\n  base:\n"
+                "    x: 10\n    y: 65\n    z: 20\n    yaw: 0.0\n    pitch: 0.0\n    world: world\n"
+                "  farm:\n"
+                "    x: 30\n    y: 70\n    z: 40\n    yaw: 90.0\n    pitch: 0.0\n    world: world\n",
+                encoding="utf-8",
+            )
+            nlogin_csv = root / "nlogin.csv"
+            nlogin_csv.write_text("last_name,unique_id,mojang_id\nAlice,,\n", encoding="utf-8")
+
+            db_path = root / "HuskHomesData.db"
+            create_sqlite_db(db_path)
+            existing_home_uuid = str(uuid.uuid4())
+            world_uuid = str(uuid.uuid4())
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("INSERT INTO huskhomes_users (uuid, username) VALUES (?, ?)", (str(alice_uuid), "Alice"))
+            conn.execute(
+                "INSERT INTO huskhomes_position_data (id, x, y, z, yaw, pitch, world_name, world_uuid, server_name) "
+                "VALUES (1, 999.5, 80.0, 999.5, 0.0, 0.0, 'world', ?, 'server')",
+                (world_uuid,),
+            )
+            conn.execute(
+                "INSERT INTO huskhomes_saved_positions (id, position_id, name, description, tags, timestamp) "
+                "VALUES (1, 1, 'base', '', NULL, '2026-01-01 00:00:00')",
+            )
+            conn.execute(
+                "INSERT INTO huskhomes_homes (uuid, saved_position_id, owner_uuid, public) VALUES (?, 1, ?, 0)",
+                (existing_home_uuid, str(alice_uuid)),
+            )
+            conn.commit()
+            conn.close()
+
+            cfg_path = root / "config.yml"
+            write_huskhomes_config(cfg_path, backend="SQLITE")
+            plan_path = root / "plan.json"
+
+            self.assertEqual(MIGRATE.main([
+                "scan",
+                "--playerdata", str(playerdata),
+                "--nlogin-csv", str(nlogin_csv),
+                "--huskhomes-config", str(cfg_path),
+                "--on-conflict", "skip",
+                "--output", str(plan_path),
+            ]), 0)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertEqual(plan["summary"]["actions"], {"create": 1, "skip": 1})
+
+            self.assertEqual(MIGRATE.main([
+                "apply",
+                "--plan", str(plan_path),
+                "--huskhomes-config", str(cfg_path),
+                "--no-backup",
+            ]), 0)
+            self.assertEqual(MIGRATE.main([
+                "verify",
+                "--plan", str(plan_path),
+                "--huskhomes-config", str(cfg_path),
+            ]), 0)
+
+            # A conflicting username inserted after scan must abort apply cleanly.
+            bob_uuid = MIGRATE.offline_uuid("Bob")
+            (playerdata / f"{bob_uuid}.yml").write_text(
+                "player:\n  info:\n    lastSeenAs: Bob\nhomes:\n  camp:\n"
+                "    x: 1\n    y: 64\n    z: 2\n    yaw: 0.0\n    pitch: 0.0\n    world: world\n",
+                encoding="utf-8",
+            )
+            nlogin_csv.write_text("last_name,unique_id,mojang_id\nAlice,,\nBob,,\n", encoding="utf-8")
+            plan2_path = root / "plan2.json"
+            self.assertEqual(MIGRATE.main([
+                "scan",
+                "--playerdata", str(playerdata),
+                "--nlogin-csv", str(nlogin_csv),
+                "--huskhomes-config", str(cfg_path),
+                "--on-conflict", "skip",
+                "--output", str(plan2_path),
+            ]), 0)
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("INSERT INTO huskhomes_users (uuid, username) VALUES (?, ?)", (str(uuid.uuid4()), "bob"))
+            conn.commit()
+            conn.close()
+            self.assertEqual(MIGRATE.main([
+                "apply",
+                "--plan", str(plan2_path),
+                "--huskhomes-config", str(cfg_path),
+                "--no-backup",
+            ]), 1)
+
+    def test_float32_equal_handles_mariadb_six_sig_digits(self) -> None:
+        self.assertTrue(MIGRATE.float32_equal(18.7184, 18.718445))
+        self.assertTrue(MIGRATE.float32_equal(113.699, 113.6987))
+        self.assertTrue(MIGRATE.float32_equal(-172.018, -172.01836))
+        self.assertTrue(MIGRATE.float32_equal(0.0, 0.0))
+        self.assertFalse(MIGRATE.float32_equal(18.8, 18.718445))
+        self.assertFalse(MIGRATE.float32_equal(113.701, 113.6987))
 
 
 if __name__ == "__main__":

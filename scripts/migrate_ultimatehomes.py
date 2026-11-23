@@ -213,11 +213,11 @@ def float32_value(value: float) -> float:
 
 
 def float32_equal(actual: float, expected: float) -> bool:
-    # HuskHomes stores yaw and pitch in 32-bit FLOAT columns on MySQL/MariaDB.
-    # Comparing against the IEEE-754 float32 representation prevents false
-    # verification failures from float64->float32 rounding.
+    # HuskHomes stores yaw and pitch in 32-bit FLOAT columns on MySQL/MariaDB,
+    # and MariaDB/MySQL text protocol formats FLOAT values to 6 significant
+    # digits (FLT_DIG=6, max relative rounding error <= 5e-6).
     target = float32_value(expected)
-    tolerance = max(1e-5, abs(target) * 1e-6)
+    tolerance = max(1e-5, abs(target) * 6e-6)
     return abs(float(actual) - target) <= tolerance
 
 
@@ -1251,6 +1251,80 @@ class HuskHomesDatabase:
         finally:
             cursor.close()
 
+    def execute_many(self, sql: str, rows: Sequence[Sequence[Any]]) -> None:
+        if not rows:
+            return
+        if self.backend == "SQLITE":
+            cursor = self.connection.executemany(sql, rows)
+            cursor.close()
+            return
+        cursor = self.connection.cursor()
+        try:
+            cursor.executemany(sql, rows)
+        finally:
+            cursor.close()
+
+    def insert_rows(
+        self,
+        table_key: str,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[Any]],
+        batch_size: int = 250,
+    ) -> None:
+        if not rows:
+            return
+        cols_sql = ", ".join(sql_ident(col) for col in columns)
+        row_ph = "(" + ",".join([self.ph] * len(columns)) + ")"
+        if self.backend == "SQLITE":
+            sql = f"INSERT INTO {self.table(table_key)} ({cols_sql}) VALUES {row_ph}"
+            self.execute_many(sql, rows)
+            return
+        table_sql = self.table(table_key)
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start : start + batch_size]
+            values_sql = ",".join([row_ph] * len(chunk))
+            flat_params = [value for row in chunk for value in row]
+            sql = f"INSERT INTO {table_sql} ({cols_sql}) VALUES {values_sql}"
+            self.execute(sql, flat_params)
+
+    def update_rows_by_key(
+        self,
+        table_key: str,
+        key_col: str,
+        update_cols: Sequence[str],
+        rows: Sequence[tuple[Any, Sequence[Any]]],
+        batch_size: int = 100,
+    ) -> None:
+        if not rows:
+            return
+        table_sql = self.table(table_key)
+        key_ident = sql_ident(key_col)
+        if self.backend == "SQLITE":
+            set_sql = ", ".join(f"{sql_ident(col)}={self.ph}" for col in update_cols)
+            sql = f"UPDATE {table_sql} SET {set_sql} WHERE {key_ident}={self.ph}"
+            self.execute_many(sql, [tuple(vals) + (key,) for key, vals in rows])
+            return
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start : start + batch_size]
+            if len(chunk) == 1:
+                key, vals = chunk[0]
+                set_sql = ", ".join(f"{sql_ident(col)}={self.ph}" for col in update_cols)
+                sql = f"UPDATE {table_sql} SET {set_sql} WHERE {key_ident}={self.ph}"
+                self.execute(sql, tuple(vals) + (key,))
+                continue
+            set_clauses: list[str] = []
+            params: list[Any] = []
+            for col_idx, col in enumerate(update_cols):
+                when_parts = " ".join(f"WHEN {self.ph} THEN {self.ph}" for _ in chunk)
+                set_clauses.append(f"{sql_ident(col)} = CASE {key_ident} {when_parts} END")
+                for key, vals in chunk:
+                    params.append(key)
+                    params.append(vals[col_idx])
+            in_ph = ",".join([self.ph] * len(chunk))
+            params.extend(key for key, _ in chunk)
+            sql = f"UPDATE {table_sql} SET {', '.join(set_clauses)} WHERE {key_ident} IN ({in_ph})"
+            self.execute(sql, params)
+
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
         if self.backend == "SQLITE":
             cursor = self.connection.execute(sql, params)
@@ -1266,6 +1340,23 @@ class HuskHomesDatabase:
             finally:
                 cursor.close()
         return [dict(row) for row in rows]
+
+    def query_in_chunks(
+        self,
+        sql_template: str,
+        keys: Sequence[Any],
+        chunk_size: int = 500,
+    ) -> list[dict[str, Any]]:
+        unique_keys = list(dict.fromkeys(keys))
+        if not unique_keys:
+            return []
+        results: list[dict[str, Any]] = []
+        for start in range(0, len(unique_keys), chunk_size):
+            chunk = unique_keys[start : start + chunk_size]
+            placeholders = ",".join([self.ph] * len(chunk))
+            sql = sql_template.replace("{placeholders}", placeholders)
+            results.extend(self.query(sql, chunk))
+        return results
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[dict[str, Any]]:
         rows = self.query(sql, params)
@@ -2277,158 +2368,236 @@ def backup_mysql(config: HuskHomesConfig, backup_dir: Path) -> Path:
     return destination
 
 
-def ensure_user(database: HuskHomesDatabase, user: Mapping[str, Any]) -> None:
-    user_uuid = parse_uuid(user.get("uuid"))
-    if user_uuid is None:
-        raise MigrationError(f"invalid user UUID in plan: {user.get('uuid')!r}")
-    username = str(user.get("username") or "")
-    if not username or len(username) > 16:
-        raise MigrationError(f"invalid username in plan for {user_uuid}: {username!r}")
-
-    existing = database.query_one(
-        f"SELECT `uuid`, `username` FROM {database.table('PLAYER_DATA')} WHERE `uuid`={database.ph}",
-        (str(user_uuid),),
-    )
-    name_owner = database.query_one(
-        f"SELECT `uuid` FROM {database.table('PLAYER_DATA')} WHERE LOWER(`username`)=LOWER({database.ph})",
-        (username,),
-    )
-    if name_owner is not None and parse_uuid(name_owner.get("uuid")) != user_uuid:
-        raise MigrationError(
-            f"HuskHomes already has username {username!r} under UUID {name_owner.get('uuid')}; "
-            f"refusing to create a duplicate-name user for {user_uuid}"
-        )
-
-    if existing is None:
-        database.execute(
-            f"INSERT INTO {database.table('PLAYER_DATA')} (`uuid`, `username`) VALUES ({database.ph},{database.ph})",
-            (str(user_uuid), username),
-        )
-    elif str(existing.get("username") or "") != username:
-        database.execute(
-            f"UPDATE {database.table('PLAYER_DATA')} SET `username`={database.ph} WHERE `uuid`={database.ph}",
-            (username, str(user_uuid)),
-        )
-
-
-def fetch_home_row(database: HuskHomesDatabase, home_uuid: uuid.UUID) -> Optional[dict[str, Any]]:
-    return database.query_one(
-        f"""
-        SELECT h.`uuid` AS home_uuid, h.`owner_uuid`, h.`public`,
-               h.`saved_position_id`, s.`position_id`, s.`name`
-        FROM {database.table('HOME_DATA')} h
-        INNER JOIN {database.table('SAVED_POSITION_DATA')} s ON h.`saved_position_id` = s.`id`
-        WHERE h.`uuid`={database.ph}
-        """,
-        (str(home_uuid),),
-    )
-
-
-def write_home(database: HuskHomesDatabase, home: Mapping[str, Any], action: str) -> None:
-    h_uuid = uuid.UUID(str(home["home_uuid"]))
-    owner_uuid = uuid.UUID(str(home["owner_uuid"]))
-    name = str(home["name"])
-    position = home["position"]
-    existing = fetch_home_row(database, h_uuid)
-
-    if action == "create":
-        if existing is not None:
-            raise MigrationError(f"plan wanted to create home {h_uuid}, but it already exists")
-        cursor = database.execute(
-            f"""
-            INSERT INTO {database.table('POSITION_DATA')}
-                (`x`, `y`, `z`, `yaw`, `pitch`, `world_name`, `world_uuid`, `server_name`)
-            VALUES ({database.ph},{database.ph},{database.ph},{database.ph},{database.ph},{database.ph},{database.ph},{database.ph})
-            """,
-            (
-                float(position["x"]), float(position["y"]), float(position["z"]),
-                float(position["yaw"]), float(position["pitch"]),
-                str(position["world_name"]), str(position["world_uuid"]),
-                str(position["server_name"]),
-            ),
-        )
-        position_id = cursor.lastrowid
-        cursor = database.execute(
-            f"""
-            INSERT INTO {database.table('SAVED_POSITION_DATA')}
-                (`position_id`, `name`, `description`, `tags`, `timestamp`)
-            VALUES ({database.ph},{database.ph},{database.ph},{database.ph},{database.ph})
-            """,
-            (position_id, name, "", None, str(home.get("timestamp") or sql_timestamp_now())),
-        )
-        saved_position_id = cursor.lastrowid
-        database.execute(
-            f"""
-            INSERT INTO {database.table('HOME_DATA')}
-                (`uuid`, `saved_position_id`, `owner_uuid`, `public`)
-            VALUES ({database.ph},{database.ph},{database.ph},{database.ph})
-            """,
-            (str(h_uuid), saved_position_id, str(owner_uuid), 0),
-        )
-        return
-
-    if action == "update":
-        if existing is None:
-            raise MigrationError(f"plan wanted to update home {h_uuid}, but it does not exist")
-        position_id = int(existing["position_id"])
-        saved_position_id = int(existing["saved_position_id"])
-        database.execute(
-            f"""
-            UPDATE {database.table('POSITION_DATA')}
-            SET `x`={database.ph}, `y`={database.ph}, `z`={database.ph},
-                `yaw`={database.ph}, `pitch`={database.ph},
-                `world_name`={database.ph}, `world_uuid`={database.ph}, `server_name`={database.ph}
-            WHERE `id`={database.ph}
-            """,
-            (
-                float(position["x"]), float(position["y"]), float(position["z"]),
-                float(position["yaw"]), float(position["pitch"]),
-                str(position["world_name"]), str(position["world_uuid"]),
-                str(position["server_name"]), position_id,
-            ),
-        )
-        database.execute(
-            f"""
-            UPDATE {database.table('SAVED_POSITION_DATA')}
-            SET `name`={database.ph}, `description`={database.ph}, `tags`={database.ph}
-            WHERE `id`={database.ph}
-            """,
-            (name, "", None, saved_position_id),
-        )
-        database.execute(
-            f"""
-            UPDATE {database.table('HOME_DATA')}
-            SET `owner_uuid`={database.ph}, `public`={database.ph}
-            WHERE `uuid`={database.ph}
-            """,
-            (str(owner_uuid), 0, str(h_uuid)),
-        )
-        return
-
-    raise MigrationError(f"unsupported write action {action!r}")
-
-
-def verify_home_in_database(
+def ensure_users_batch(
     database: HuskHomesDatabase,
-    home: Mapping[str, Any],
-    require_exact: bool = True,
-) -> None:
-    h_uuid = uuid.UUID(str(home["home_uuid"]))
-    existing = home.get("existing") if home.get("action") == "skip" else None
-    lookup_uuid = uuid.UUID(str(existing["home_uuid"])) if existing else h_uuid
-    row = database.query_one(
+    users: Sequence[Mapping[str, Any]],
+) -> tuple[int, int]:
+    validated: list[tuple[uuid.UUID, str]] = []
+    for user in users:
+        user_uuid = parse_uuid(user.get("uuid"))
+        if user_uuid is None:
+            raise MigrationError(f"invalid user UUID in plan: {user.get('uuid')!r}")
+        username = str(user.get("username") or "")
+        if not username or len(username) > 16:
+            raise MigrationError(f"invalid username in plan for {user_uuid}: {username!r}")
+        validated.append((user_uuid, username))
+
+    if not validated:
+        return 0, 0
+
+    existing_users = database.fetch_users()
+    by_lower_name: dict[str, set[uuid.UUID]] = defaultdict(set)
+    for existing_uuid, row in existing_users.items():
+        existing_name = str(row.get("username") or "")
+        if existing_name:
+            by_lower_name[existing_name.lower()].add(existing_uuid)
+
+    to_insert: list[tuple[str, str]] = []
+    to_update: list[tuple[str, Sequence[Any]]] = []
+
+    for user_uuid, username in validated:
+        lower_name = username.lower()
+        other_owners = by_lower_name.get(lower_name, set()) - {user_uuid}
+        if other_owners:
+            conflict_uuid = sorted(map(str, other_owners))[0]
+            raise MigrationError(
+                f"HuskHomes already has username {username!r} under UUID {conflict_uuid}; "
+                f"refusing to create a duplicate-name user for {user_uuid}"
+            )
+
+        existing = existing_users.get(user_uuid)
+        if existing is None:
+            to_insert.append((str(user_uuid), username))
+            by_lower_name[lower_name].add(user_uuid)
+            existing_users[user_uuid] = {"uuid": str(user_uuid), "username": username}
+        else:
+            old_name = str(existing.get("username") or "")
+            if old_name != username:
+                to_update.append((str(user_uuid), (username,)))
+                if old_name:
+                    by_lower_name[old_name.lower()].discard(user_uuid)
+                by_lower_name[lower_name].add(user_uuid)
+                existing_users[user_uuid] = {"uuid": str(user_uuid), "username": username}
+
+    database.insert_rows("PLAYER_DATA", ("uuid", "username"), to_insert)
+    database.update_rows_by_key("PLAYER_DATA", "uuid", ("username",), to_update)
+    return len(to_insert), len(to_update)
+
+
+def fetch_home_rows_by_uuids(
+    database: HuskHomesDatabase,
+    home_uuids: Sequence[str],
+) -> dict[uuid.UUID, dict[str, Any]]:
+    rows = database.query_in_chunks(
         f"""
         SELECT h.`uuid` AS home_uuid, h.`owner_uuid`, h.`public`,
+               h.`saved_position_id`, s.`position_id`,
                s.`name`, s.`description`, s.`tags`,
                p.`x`, p.`y`, p.`z`, p.`yaw`, p.`pitch`,
                p.`world_name`, p.`world_uuid`, p.`server_name`
         FROM {database.table('HOME_DATA')} h
         INNER JOIN {database.table('SAVED_POSITION_DATA')} s ON h.`saved_position_id` = s.`id`
         INNER JOIN {database.table('POSITION_DATA')} p ON s.`position_id` = p.`id`
-        WHERE h.`uuid`={database.ph}
+        WHERE h.`uuid` IN ({{placeholders}})
         """,
-        (str(lookup_uuid),),
+        home_uuids,
     )
+    result: dict[uuid.UUID, dict[str, Any]] = {}
+    for row in rows:
+        h_uuid = parse_uuid(row.get("home_uuid"))
+        if h_uuid is None:
+            raise MigrationError("invalid UUID found in HuskHomes home data")
+        result[h_uuid] = row
+    return result
+
+
+def write_homes_batch(
+    database: HuskHomesDatabase,
+    homes: Sequence[Mapping[str, Any]],
+    default_timestamp: Optional[str] = None,
+) -> tuple[int, int, int]:
+    if not homes:
+        return 0, 0, 0
+
+    lookup_uuids: list[str] = []
+    for home in homes:
+        action = str(home.get("action"))
+        if action not in ("create", "update", "skip"):
+            raise MigrationError(f"unsupported plan action {action!r}")
+        h_uuid = uuid.UUID(str(home["home_uuid"]))
+        lookup_uuids.append(str(h_uuid))
+        if action == "skip" and home.get("existing"):
+            lookup_uuids.append(str(uuid.UUID(str(home["existing"]["home_uuid"]))))
+
+    existing_by_uuid = fetch_home_rows_by_uuids(database, lookup_uuids)
+
+    creates: list[Mapping[str, Any]] = []
+    updates: list[tuple[Mapping[str, Any], dict[str, Any]]] = []
+    skip_count = 0
+
+    for home in homes:
+        action = str(home.get("action"))
+        h_uuid = uuid.UUID(str(home["home_uuid"]))
+        existing = existing_by_uuid.get(h_uuid)
+        if action == "create":
+            if existing is not None:
+                raise MigrationError(f"plan wanted to create home {h_uuid}, but it already exists")
+            creates.append(home)
+        elif action == "update":
+            if existing is None:
+                raise MigrationError(f"plan wanted to update home {h_uuid}, but it does not exist")
+            updates.append((home, existing))
+        elif action == "skip":
+            skip_existing = home.get("existing")
+            skip_uuid = uuid.UUID(str(skip_existing["home_uuid"])) if skip_existing else h_uuid
+            verify_home_row(home, existing_by_uuid.get(skip_uuid))
+            skip_count += 1
+
+    fallback_ts = default_timestamp or sql_timestamp_now()
+
+    if creates:
+        max_pos_row = database.query_one(
+            f"SELECT COALESCE(MAX(`id`), 0) AS max_id FROM {database.table('POSITION_DATA')}"
+        )
+        max_saved_row = database.query_one(
+            f"SELECT COALESCE(MAX(`id`), 0) AS max_id FROM {database.table('SAVED_POSITION_DATA')}"
+        )
+        next_pos_id = int((max_pos_row or {}).get("max_id") or 0) + 1
+        next_saved_id = int((max_saved_row or {}).get("max_id") or 0) + 1
+
+        pos_rows: list[tuple[Any, ...]] = []
+        saved_rows: list[tuple[Any, ...]] = []
+        home_rows: list[tuple[Any, ...]] = []
+
+        for offset, home in enumerate(creates):
+            pos_id = next_pos_id + offset
+            saved_id = next_saved_id + offset
+            h_uuid = uuid.UUID(str(home["home_uuid"]))
+            owner_uuid = uuid.UUID(str(home["owner_uuid"]))
+            name = str(home["name"])
+            position = home["position"]
+
+            pos_rows.append((
+                float(position["x"]), float(position["y"]), float(position["z"]),
+                float(position["yaw"]), float(position["pitch"]),
+                str(position["world_name"]), str(position["world_uuid"]),
+                str(position["server_name"]), pos_id,
+            ))
+            saved_rows.append((
+                pos_id, name, "", None, str(home.get("timestamp") or fallback_ts), saved_id,
+            ))
+            home_rows.append((str(h_uuid), saved_id, str(owner_uuid), 0))
+
+        database.insert_rows(
+            "POSITION_DATA",
+            ("x", "y", "z", "yaw", "pitch", "world_name", "world_uuid", "server_name", "id"),
+            pos_rows,
+        )
+        database.insert_rows(
+            "SAVED_POSITION_DATA",
+            ("position_id", "name", "description", "tags", "timestamp", "id"),
+            saved_rows,
+        )
+        database.insert_rows(
+            "HOME_DATA",
+            ("uuid", "saved_position_id", "owner_uuid", "public"),
+            home_rows,
+        )
+
+    if updates:
+        pos_updates: list[tuple[int, Sequence[Any]]] = []
+        saved_updates: list[tuple[int, Sequence[Any]]] = []
+        home_updates: list[tuple[str, Sequence[Any]]] = []
+
+        for home, existing in updates:
+            h_uuid = uuid.UUID(str(home["home_uuid"]))
+            owner_uuid = uuid.UUID(str(home["owner_uuid"]))
+            name = str(home["name"])
+            position = home["position"]
+            position_id = int(existing["position_id"])
+            saved_position_id = int(existing["saved_position_id"])
+
+            pos_updates.append((
+                position_id,
+                (
+                    float(position["x"]), float(position["y"]), float(position["z"]),
+                    float(position["yaw"]), float(position["pitch"]),
+                    str(position["world_name"]), str(position["world_uuid"]),
+                    str(position["server_name"]),
+                ),
+            ))
+            saved_updates.append((saved_position_id, (name, "", None)))
+            home_updates.append((str(h_uuid), (str(owner_uuid), 0)))
+
+        database.update_rows_by_key(
+            "POSITION_DATA",
+            "id",
+            ("x", "y", "z", "yaw", "pitch", "world_name", "world_uuid", "server_name"),
+            pos_updates,
+        )
+        database.update_rows_by_key(
+            "SAVED_POSITION_DATA",
+            "id",
+            ("name", "description", "tags"),
+            saved_updates,
+        )
+        database.update_rows_by_key(
+            "HOME_DATA",
+            "uuid",
+            ("owner_uuid", "public"),
+            home_updates,
+        )
+
+    return len(creates), len(updates), skip_count
+
+
+def verify_home_row(
+    home: Mapping[str, Any],
+    row: Optional[Mapping[str, Any]],
+) -> None:
+    h_uuid = uuid.UUID(str(home["home_uuid"]))
+    existing = home.get("existing") if home.get("action") == "skip" else None
+    lookup_uuid = uuid.UUID(str(existing["home_uuid"])) if existing else h_uuid
     if row is None:
         raise MigrationError(f"verification failed: home {lookup_uuid} is missing")
 
@@ -2478,18 +2647,43 @@ def verify_home_in_database(
 
 def verify_plan_in_database(database: HuskHomesDatabase, plan: Mapping[str, Any]) -> None:
     homes = plan.get("homes", [])
+    lookup_uuids: list[str] = []
     for home in homes:
         if home.get("action") == "blocked":
             raise MigrationError(f"blocked home in plan: {home.get('home_uuid')}")
-        verify_home_in_database(database, home)
+        h_uuid = uuid.UUID(str(home["home_uuid"]))
+        existing = home.get("existing") if home.get("action") == "skip" else None
+        lookup_uuid = uuid.UUID(str(existing["home_uuid"])) if existing else h_uuid
+        lookup_uuids.append(str(lookup_uuid))
+
+    home_rows = fetch_home_rows_by_uuids(database, lookup_uuids)
+    for home in homes:
+        h_uuid = uuid.UUID(str(home["home_uuid"]))
+        existing = home.get("existing") if home.get("action") == "skip" else None
+        lookup_uuid = uuid.UUID(str(existing["home_uuid"])) if existing else h_uuid
+        verify_home_row(home, home_rows.get(lookup_uuid))
 
     # Verify users too.
-    for user in plan.get("users", []):
+    users = plan.get("users", [])
+    user_uuids: list[uuid.UUID] = []
+    for user in users:
         user_uuid = parse_uuid(user.get("uuid"))
-        row = database.query_one(
-            f"SELECT `username` FROM {database.table('PLAYER_DATA')} WHERE `uuid`={database.ph}",
-            (str(user_uuid),),
-        )
+        if user_uuid is None:
+            raise MigrationError(f"invalid user UUID in plan: {user.get('uuid')!r}")
+        user_uuids.append(user_uuid)
+
+    user_rows = database.query_in_chunks(
+        f"SELECT `uuid`, `username` FROM {database.table('PLAYER_DATA')} WHERE `uuid` IN ({{placeholders}})",
+        [str(u) for u in user_uuids],
+    )
+    db_users: dict[uuid.UUID, dict[str, Any]] = {}
+    for row in user_rows:
+        row_uuid = parse_uuid(row.get("uuid"))
+        if row_uuid is not None:
+            db_users[row_uuid] = row
+
+    for user, user_uuid in zip(users, user_uuids):
+        row = db_users.get(user_uuid)
         if row is None:
             raise MigrationError(f"verification failed: user {user_uuid} is missing")
         if str(row.get("username")) != str(user.get("username")):
@@ -2526,21 +2720,26 @@ def apply_plan(
                 backup_path = backup_mysql(config, directory)
                 log(f"Backup written to {backup_path}")
 
+        users = plan.get("users", [])
+        homes = plan.get("homes", [])
+        log(f"Applying {len(users)} user(s) and {len(homes)} home(s)...")
+
         database.begin()
         try:
-            for user in plan.get("users", []):
-                ensure_user(database, user)
-            for home in plan.get("homes", []):
-                action = str(home.get("action"))
-                if action in ("create", "update"):
-                    write_home(database, home, action)
-                elif action == "skip":
-                    # Ensure the existing home really is the one we believe it is.
-                    verify_home_in_database(database, home)
-                else:
-                    raise MigrationError(f"unsupported plan action {action!r}")
+            users_created, users_updated = ensure_users_batch(database, users)
+            log(f"Users synced ({users_created} inserted, {users_updated} updated).")
+            homes_created, homes_updated, homes_skipped = write_homes_batch(
+                database,
+                homes,
+                default_timestamp=str(plan.get("database_timestamp") or sql_timestamp_now()),
+            )
+            log(
+                f"Homes written ({homes_created} created, {homes_updated} updated, "
+                f"{homes_skipped} skipped). Verifying before commit..."
+            )
             verify_plan_in_database(database, plan)
             database.commit()
+            log("Transaction committed. Running post-commit verification...")
         except Exception:
             database.rollback()
             raise
